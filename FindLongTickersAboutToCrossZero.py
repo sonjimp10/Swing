@@ -3,6 +3,7 @@ import os
 import sys
 import pandas as pd
 import numpy as np
+from datetime import time as dtime
 
 # ===================== CONFIG =====================
 DATA_DIR      = "ALPACA_DAILY_DATA"
@@ -19,6 +20,11 @@ MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 # Signal detection
 ALLOW_PENDING_TODAY = True            # include today's bar if it's the best negative green bar but cross not yet happened
 
+# Optional relaxed checks for pending-today evaluation (start strict)
+NEAR_ZERO_EPS   = 0.0     # e.g., 0.0005 treats tiny positive as "still negative"
+RUN_MAX_ABS_TOL = 0.0     # e.g., 0.0005 absolute wiggle room to be "highest of run"
+RUN_MAX_REL_TOL = 0.0     # e.g., 0.05 (=5%) relative wiggle vs run_max
+
 # Hard filters (liquidity / price)
 MIN_PRICE        = 5.0
 MIN_ADTV_SHARES  = 1_000_000          # 20D avg shares
@@ -30,6 +36,12 @@ TR_EXPAND_MIN    = 1.20               # event-day TrueRange / ATR(20)
 ATR_PCT_RANGE    = (0.02, 0.07)       # sweet spot ATR% (2%-7%) for 1-2 day bursts
 ROOM_TO_RUN_ATR  = 1.0                # room to 20D high should be >= 1 x ATR(20)
 RR_MIN           = 1.5                # simple reward:risk using event low/EMA20 as stop
+
+# Build a provisional "today" daily candle from 5-min RTH data ONLY (no premarket)
+INCLUDE_TODAY_FROM_INTRADAY = True
+INTRADAY_DIR = "ALPACA_DATA"
+TZ_EU = "Europe/Amsterdam"        # how your minute CSVs were saved
+TZ_NY = "America/New_York"
 
 # Weights for ranking score (tune to taste; higher = more influence)
 W = {
@@ -46,6 +58,11 @@ W = {
     "hist_closeness": 0.5,  # closer to 0 (less negative) gets a small bump
     "pending_penalty": -0.2 # slight penalty if cross is still pending (today)
 }
+
+# Debug controls
+DEBUG = True
+DEBUG_TICKERS = []          # e.g. ["PHM","COIN"]
+DEBUG_SAMPLE  = 12          # print up to N sample failure reasons
 # ===================================================
 
 def log(msg):
@@ -62,18 +79,99 @@ def load_tickers(csv_path: str):
             return s[(s!="") & s.notna()].unique().tolist()
     raise ValueError(f"No ticker column in {csv_path}. Columns: {list(df.columns)}")
 
+# ---------- diagnostics ----------
+TODAY_ATTEMPTED = 0
+TODAY_APPENDED  = 0
+TODAY_EMPTY     = 0
+TODAY_BEFORE_RTH= 0
+EVENT_TODAY     = 0
+EVENT_PENDING   = 0
+FAIL_SAMPLES    = []
+
+def _load_intraday_today_ohlcv(ticker: str):
+    """
+    Aggregate today's 5-min RTH bars (09:30–now ET) into a provisional daily OHLCV.
+    Returns dict or {"before_rth": True} if run before RTH; None if nothing.
+    """
+    fp = os.path.join(INTRADAY_DIR, f"{ticker}.csv")
+    if not os.path.exists(fp):
+        return None
+
+    dfm = pd.read_csv(fp, parse_dates=["Date"])
+    dfm.rename(columns={"Date":"dt","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
+
+    try:
+        dfm["dt"] = dfm["dt"].dt.tz_localize(TZ_EU, ambiguous="infer").dt.tz_convert(TZ_NY)
+    except Exception:
+        dfm["dt"] = dfm["dt"].dt.tz_convert(TZ_NY)
+
+    dfm.set_index("dt", inplace=True)
+
+    now_ny   = pd.Timestamp.now(tz=TZ_NY)
+    today_ny = now_ny.date()
+
+    if now_ny.time() < dtime(9,30):
+        return {"before_rth": True}
+
+    day = dfm[dfm.index.date == today_ny]
+    # RTH only and up to now
+    day = day.between_time(dtime(9,30), now_ny.time())
+
+    if day.empty:
+        return None
+
+    return {
+        "date":   pd.Timestamp(today_ny).tz_localize(None),
+        "open":   float(day["open"].iloc[0]),
+        "high":   float(day["high"].max()),
+        "low":    float(day["low"].min()),
+        "close":  float(day["close"].iloc[-1]),
+        "volume": float(day["volume"].sum()),
+    }
+
+def _augment_daily_with_today(df_daily: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    global TODAY_ATTEMPTED, TODAY_APPENDED, TODAY_EMPTY, TODAY_BEFORE_RTH
+    if not INCLUDE_TODAY_FROM_INTRADAY:
+        return df_daily
+
+    TODAY_ATTEMPTED += 1
+    today_bar = _load_intraday_today_ohlcv(ticker)
+
+    if today_bar is None:
+        TODAY_EMPTY += 1
+        return df_daily
+
+    if isinstance(today_bar, dict) and today_bar.get("before_rth"):
+        TODAY_BEFORE_RTH += 1
+        return df_daily
+
+    df = df_daily.copy()
+    idx = today_bar["date"]
+    df.loc[idx, ["open","high","low","close","volume"]] = [
+        today_bar["open"], today_bar["high"], today_bar["low"], today_bar["close"], today_bar["volume"]
+    ]
+    df.sort_index(inplace=True)
+    TODAY_APPENDED += 1
+    return df
+
 def load_daily(ticker: str) -> pd.DataFrame:
-    """Read daily CSV (Date, Open, High, Low, Close, Volume) and limit to lookback."""
+    """Read daily CSV and optionally augment with today's intraday RTH bar."""
     fp = os.path.join(DATA_DIR, f"{ticker}.csv")
     if not os.path.exists(fp):
         return pd.DataFrame()
+
     df = pd.read_csv(fp, parse_dates=["Date"])
     df.rename(columns={"Date":"date","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
     df.set_index("date", inplace=True)
     df.sort_index(inplace=True)
+
+    if INCLUDE_TODAY_FROM_INTRADAY:
+        df = _augment_daily_with_today(df, ticker)
+
     if LOOKBACK_CAL_DAYS:
-        cutoff = (pd.Timestamp.now(tz="America/New_York").normalize() - pd.Timedelta(days=LOOKBACK_CAL_DAYS)).tz_localize(None)
+        cutoff = (pd.Timestamp.now(tz=TZ_NY).normalize() - pd.Timedelta(days=LOOKBACK_CAL_DAYS)).tz_localize(None)
         df = df[df.index >= cutoff]
+
     return df
 
 def ema(s, span): 
@@ -114,109 +212,133 @@ def rs_slope_pos(price: pd.Series, bench: pd.Series, lookback=15):
     except Exception:
         return np.nan
 
+# ---------- Event detection (fixed & enhanced) ----------
+def _is_highest_of_run(hist: pd.Series, cand):
+    """Return (ok, h_c, run_max). ok True if cand is highest (closest to zero) in its negative run."""
+    h_c = float(hist.loc[cand])
+
+    # find start of negative run: bar after the last non-negative before cand
+    nonneg_before = (hist[:cand] >= 0)
+    if nonneg_before.any():
+        last_nonneg = nonneg_before[::-1].idxmax()
+        if nonneg_before.loc[last_nonneg]:
+            start_loc = min(hist.index.get_loc(last_nonneg) + 1, hist.index.get_loc(cand))
+            neg_run_start = hist.index[start_loc]
+        else:
+            neg_run_start = hist.index[0]
+    else:
+        neg_run_start = hist.index[0]
+
+    neg_run = hist.loc[neg_run_start:cand]
+    neg_run = neg_run[neg_run < 0]
+    if neg_run.empty:
+        return (False, h_c, np.nan)
+
+    run_max = float(neg_run.max())
+    tol = max(RUN_MAX_ABS_TOL, RUN_MAX_REL_TOL * abs(run_max))
+    return (h_c >= run_max - tol, h_c, run_max)
+
 def last_neg_green_event(hist: pd.Series, allow_pending=True):
     """
-    Find the most recent event bar E such that:
-      - E is negative (hist[E] < 0)
-      - E is "green" vs previous bar (hist[E] > hist[E-1])
-      - E is the highest (closest to zero) of the contiguous negative run into the next upward cross.
-    If no cross has occurred yet and allow_pending=True, allow E to be the last bar in the series if it satisfies the above.
-    Returns dict: {event_date, cross_date (or None), hist_event, pending_cross (bool)}
+    Pick the most recent valid event:
+      1) If today's hist <= NEAR_ZERO_EPS, prefer a PENDING-TODAY candidate (negative, green, highest-of-run).
+      2) Else, use the most recent UP cross and test t-1 (negative, green, highest-of-run).
     """
     if len(hist) < 5:
         return None
 
-    # Identify upward crosses (first positive after non-positive)
+    today_idx = hist.index[-1]
+    h_last = float(hist.iloc[-1])
+
+    # 1) Pending today path (prefer today if still negative / near zero and rising)
+    if allow_pending and (h_last <= NEAR_ZERO_EPS):
+        if len(hist) >= 2:
+            prev_idx = hist.index[-2]
+            h_prev = float(hist.loc[prev_idx])
+            neg_and_green = (h_last < NEAR_ZERO_EPS) and (h_last > h_prev)
+            if neg_and_green:
+                ok, h_c, run_max = _is_highest_of_run(hist, today_idx)
+                if ok:
+                    return {
+                        "event_date": today_idx,
+                        "cross_date": None,
+                        "hist_event": h_c,
+                        "pending_cross": True,
+                    }
+        # fall through to cross-based evaluation if not ok
+
+    # 2) Most recent UP cross path
     positive = hist > 0
     cross_up = positive & (~positive.shift(1, fill_value=False))
+    if not cross_up.any():
+        return None
 
-    if cross_up.any():
-        cross_idx = hist.index[cross_up][-1]
-        i = hist.index.get_loc(cross_idx)
-        if i - 1 < 1:
-            return None
-        cand = hist.index[i - 1]
-        prev = hist.index[i - 2]
-        h_c, h_p = float(hist.loc[cand]), float(hist.loc[prev])
+    cross_idx = hist.index[cross_up][-1]
+    i = hist.index.get_loc(cross_idx)
+    if i - 1 < 1:
+        return None
+    cand = hist.index[i - 1]
+    prev = hist.index[i - 2]
+    h_c, h_p = float(hist.loc[cand]), float(hist.loc[prev])
 
-        if not (h_c < 0 and h_c > h_p):  # negative & green
-            return None
+    # negative & green
+    if not (h_c < 0 and h_c > h_p):
+        return None
 
-        # Determine start of negative run leading into cross
-        nonneg_before = (hist[:cand] >= 0)
-        if nonneg_before.any():
-            last_nonneg = nonneg_before[::-1].idxmax()
-            if nonneg_before.loc[last_nonneg]:
-                start_loc = min(hist.index.get_loc(last_nonneg) + 1, hist.index.get_loc(cand))
-                neg_run_start = hist.index[start_loc]
-            else:
-                neg_run_start = hist.index[0]
-        else:
-            neg_run_start = hist.index[0]
+    ok, h_c, run_max = _is_highest_of_run(hist, cand)
+    if not ok:
+        return None
 
-        neg_run = hist.loc[neg_run_start:cand]
-        neg_run = neg_run[neg_run < 0]
-        if neg_run.empty:
-            return None
+    return {
+        "event_date": cand,
+        "cross_date": cross_idx,
+        "hist_event": h_c,
+        "pending_cross": False,   # FIX: real cross → not pending
+    }
 
-        if abs(h_c - float(neg_run.max())) > 1e-12:
-            return None
+# ---------- Features & scoring ----------
+def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None, ticker: str):
+    global EVENT_TODAY, EVENT_PENDING, FAIL_SAMPLES
 
-        return {
-            "event_date": cand,
-            "cross_date": cross_idx,
-            "hist_event": h_c,
-            "pending_cross": False
-        }
-
-    # No cross yet: allow pending candidate (today) if desired
-    if allow_pending:
-        # Use last bar as candidate
-        cand = hist.index[-1]
-        if len(hist) < 2:
-            return None
-        prev = hist.index[-2]
-        h_c, h_p = float(hist.loc[cand]), float(hist.loc[prev])
-        if not (h_c < 0 and h_c > h_p):
-            return None
-        # must be highest of current negative run
-        nonneg_before = (hist[:cand] >= 0)
-        if nonneg_before.any():
-            last_nonneg = nonneg_before[::-1].idxmax()
-            if nonneg_before.loc[last_nonneg]:
-                start_loc = min(hist.index.get_loc(last_nonneg) + 1, hist.index.get_loc(cand))
-                neg_run_start = hist.index[start_loc]
-            else:
-                neg_run_start = hist.index[0]
-        else:
-            neg_run_start = hist.index[0]
-        neg_run = hist.loc[neg_run_start:cand]
-        neg_run = neg_run[neg_run < 0]
-        if neg_run.empty:
-            return None
-        if abs(h_c - float(neg_run.max())) > 1e-12:
-            return None
-        return {
-            "event_date": cand,
-            "cross_date": None,
-            "hist_event": h_c,
-            "pending_cross": True
-        }
-
-    return None
-
-def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None):
     if df.empty or "close" not in df.columns:
         return None
 
     macd, sig, hist = macd_hist(df["close"])
     evt = last_neg_green_event(hist, allow_pending=ALLOW_PENDING_TODAY)
     if not evt:
+        if DEBUG and len(FAIL_SAMPLES) < DEBUG_SAMPLE:
+            # Show why last few failed TODAY specifically (if today exists)
+            today_idx = pd.Timestamp.now(tz=TZ_NY).normalize().tz_localize(None)
+            in_idx = today_idx in df.index
+            if in_idx and len(hist) >= 2:
+                h0 = float(hist.iloc[-1]); h1 = float(hist.iloc[-2])
+                ok_run, h_c_tmp, run_max_tmp = _is_highest_of_run(hist, hist.index[-1])
+                reasons = []
+                if not (h0 <= NEAR_ZERO_EPS): reasons.append("today_not_negative")
+                if not (h0 > h1): reasons.append("not_green")
+                if not ok_run: reasons.append(f"not_run_max(delta={run_max_tmp - h0:.6f})")
+                if not reasons: reasons = ["other"]
+                FAIL_SAMPLES.append(
+                    f"[{ticker}] today check: h[-2]={h1:.5f}, h[-1]={h0:.5f}, run_max={run_max_tmp:.5f} | reasons={','.join(reasons)}"
+                )
+            else:
+                FAIL_SAMPLES.append(f"[{ticker}] no-event | today_in_index={in_idx} | hist_tail={', '.join(f'{x:.5f}' for x in hist.tail(3).values)}")
         return None
 
     ed = evt["event_date"]
     if ed not in df.index:
         return None
+
+    # mark if event is today / pending
+    today_naive = pd.Timestamp.now(tz=TZ_NY).normalize().tz_localize(None)
+    if ed == today_naive:
+        EVENT_TODAY += 1
+        if evt["pending_cross"]:
+            EVENT_PENDING += 1
+
+    if ticker in DEBUG_TICKERS:
+        log(f"[DEBUG {ticker}] EVENT={ed.date()}  CROSS={'PENDING' if evt['pending_cross'] else evt['cross_date'].date() if evt['cross_date'] is not None else 'None'} "
+            f"| hist_event={evt['hist_event']:.5f} | hist_tail={', '.join(f'{x:.5f}' for x in hist.tail(4).values)}")
 
     row = df.loc[ed]
     # EMAs
@@ -227,6 +349,8 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None):
     v20 = df["volume"].rolling(20).mean().loc[ed] if len(df) >= 20 and ed in df.index else np.nan
     adtv_ok = float(v20 >= MIN_ADTV_SHARES) if np.isfinite(v20) else 0.0
     price_ok = float(row["close"] >= MIN_PRICE)
+    if not (price_ok and adtv_ok):
+        return None
 
     # Volume surge
     vol_surge = float(row["volume"] / v20) if (np.isfinite(v20) and v20 > 0) else np.nan
@@ -270,7 +394,7 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None):
     hist_value = float(evt["hist_event"])
     hist_closeness = float(-hist_value)  # more negative → smaller; we will squash later
 
-    # Score (combine features)
+    # Score (combine features) — unchanged
     score = (
         W["price_above_20"] * price_above_20 +
         W["price_above_50"] * price_above_50 +
@@ -288,6 +412,7 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None):
 
     return {
         "event_date": ed.date().isoformat(),
+        "cross_date": (evt["cross_date"].date().isoformat() if evt["cross_date"] is not None else None),
         "pending_cross": bool(evt["pending_cross"]),
         "hist_event": hist_value,
         "score": float(score),
@@ -306,6 +431,7 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None):
         "rs_slope_pos": float(rs_pos) if np.isfinite(rs_pos) else np.nan,
     }
 
+# ---------- Main ----------
 def main():
     # Load tickers
     try:
@@ -320,29 +446,35 @@ def main():
     bench_df = load_daily(BENCH_TICKER) if os.path.exists(bench_path) else None
 
     rows = []
+    scanned = 0
     for i, tk in enumerate(tickers, 1):
         if i % 150 == 0:
             log(f"Progress: {i}/{len(tickers)}")
         try:
             df = load_daily(tk)
+            scanned += 1
             if df.empty or len(df) < 25:  # need enough bars to warm MACD/ATR
                 continue
 
-            # Hard filters first
-            last = df.iloc[-1]
-            price_ok = last["close"] >= MIN_PRICE
-            v20 = df["volume"].rolling(20).mean().iloc[-1] if len(df) >= 20 else np.nan
-            adtv_ok = (v20 >= MIN_ADTV_SHARES) if np.isfinite(v20) else False
-            if not (price_ok and adtv_ok):
-                continue
-
-            feats = features_for_event(df, bench_df)
+            feats = features_for_event(df, bench_df, tk)
             if feats is None:
                 continue
 
             rows.append({"ticker": tk, **feats})
-        except Exception:
+        except Exception as e:
+            if DEBUG and len(FAIL_SAMPLES) < DEBUG_SAMPLE:
+                FAIL_SAMPLES.append(f"[{tk}] EXCEPTION: {e}")
             continue
+
+    # ---------- Debug summary ----------
+    today_naive = pd.Timestamp.now(tz=TZ_NY).normalize().tz_localize(None)
+    log(f"Today augmentation (RTH only): attempted={TODAY_ATTEMPTED}  appended={TODAY_APPENDED}  empty={TODAY_EMPTY}  beforeRTH={TODAY_BEFORE_RTH}")
+    log(f"Events with event_date == today({today_naive.date()}): {EVENT_TODAY}  (pending={EVENT_PENDING})")
+
+    if DEBUG and FAIL_SAMPLES:
+        log("Sample failures (today-specific reasons for no event):")
+        for line in FAIL_SAMPLES:
+            log("  " + line)
 
     if not rows:
         log("No candidates found with current settings.")
