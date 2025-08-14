@@ -15,7 +15,7 @@ LOOKBACK_CAL_DAYS = 75                # ~2.5 months (calendar) is fine for MACD(
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ALLOW_PENDING_TODAY = True            # allow “today” as the event if still negative & rising
 
-# Optional relaxed checks for “pending today”
+# Optional relaxed checks for “pending today” (start strict; set small tolerances if needed)
 NEAR_ZERO_EPS   = 0.0                 # treat h ≥ -eps as negative (e.g., 0.0005)
 RUN_MAX_ABS_TOL = 0.0                 # absolute wiggle for “highest of run”
 RUN_MAX_REL_TOL = 0.0                 # relative wiggle as fraction of |run_max| (e.g., 0.05 = 5%)
@@ -85,7 +85,8 @@ def load_tickers_and_floats(csv_path: str):
     float_map = None
     if col_fs:
         try:
-            f = df[[col_tk, col_fs]].copy()
+            f = df[[col_tk, col_fs]].dropna()
+            # keep zeros (0 means “unknown or zero” → we won’t divide by it)
             f[col_fs] = pd.to_numeric(f[col_fs], errors="coerce")
             float_map = dict(zip(f[col_tk], f[col_fs]))
             log(f"Loaded float shares from {csv_path} ({len(float_map)} tickers with numeric values).")
@@ -262,19 +263,21 @@ def last_neg_green_event(hist: pd.Series, allow_pending=True):
     if not ok: return None
     return {"event_date": cand, "cross_date": cross_idx, "hist_event": h_c, "pending_cross": False}
 
-# ---------- Helpers for KPIs at arbitrary index ----------
+# ---------- Feature helpers ----------
 def overhead_supply_ratio(df, ed, lookback=40):
     """
     'Overhead supply' = fraction of volume in the last `lookback` sessions
-    where the CLOSE was ABOVE the reference close. Lower is better.
+    where the CLOSE was ABOVE the event-day close. Holders who paid more than
+    today are more likely to sell on rallies to 'get back to even'.
+    Lower is better (less potential supply overhead).
     """
     if ed not in df.index: return np.nan
     end_loc = df.index.get_loc(ed)
     start_loc = max(0, end_loc - lookback + 1)
     win = df.iloc[start_loc:end_loc+1]
     if win.empty: return np.nan
-    ref_close = df.loc[ed, "close"]
-    v_above = win.loc[win["close"] > ref_close, "volume"].sum()
+    event_close = df.loc[ed, "close"]
+    v_above = win.loc[win["close"] > event_close, "volume"].sum()
     v_tot   = win["volume"].sum()
     return float(v_above / v_tot) if v_tot > 0 else np.nan
 
@@ -294,144 +297,10 @@ def anchored_vwap(df, anchor_idx, ed):
     cum_v  = s["volume"].cumsum()
     return float(cum_pv.iloc[-1] / cum_v.iloc[-1]) if cum_v.iloc[-1] > 0 else np.nan
 
-def compute_kpis_at(df: pd.DataFrame, bench_df: pd.DataFrame | None, idx, float_map, ticker):
-    """Return a dict of KPIs computed as of index `idx` (no suffix)."""
-    out = {}
-    if idx not in df.index:
-        return out
-
-    row = df.loc[idx]
-    ema20 = ema(df["close"], 20)
-    ema50 = ema(df["close"], 50)
-
-    # volumes
-    v20 = df["volume"].rolling(20).mean().loc[idx] if len(df) >= 20 else np.nan
-    vol = float(row["volume"]) if not pd.isna(row["volume"]) else np.nan
-    rel_vol_20 = float(vol / v20) if (np.isfinite(vol) and np.isfinite(v20) and v20>0) else np.nan
-    # pocket-pivot style (exclude current via shift(1))
-    vol_highest_10 = float(vol >= df["volume"].shift(1).rolling(10).max().loc[idx]) if len(df) >= 11 and np.isfinite(vol) else np.nan
-    vol_highest_5  = float(vol >= df["volume"].shift(1).rolling(5).max().loc[idx])  if len(df) >= 6  and np.isfinite(vol) else np.nan
-
-    # rank/percentile
-    def _rank_in_window(series, idx, win):
-        if idx not in series.index: return np.nan
-        end = series.index.get_loc(idx); start = max(0, end - win + 1)
-        w = series.iloc[start:end+1]
-        if w.empty or pd.isna(series.loc[idx]): return np.nan
-        return float((w.rank(ascending=False, method="min").loc[idx]))
-    vol_rank_10 = _rank_in_window(df["volume"], idx, 10)
-    vol_rank_20 = _rank_in_window(df["volume"], idx, 20)
-    vol_pctile_20 = float(100.0 * (21 - vol_rank_20) / 20.0) if vol_rank_20 == vol_rank_20 else np.nan
-
-    # green price & vol bar
-    prev_close = df["close"].shift(1).loc[idx] if idx in df.index else np.nan
-    price_green = float(row["close"] >= row["open"]) if (np.isfinite(row["close"]) and np.isfinite(row["open"])) else np.nan
-    vol_green   = float(row["close"] >= prev_close) if (np.isfinite(row["close"]) and np.isfinite(prev_close)) else np.nan
-    green_price_and_vol = float(price_green==1.0 and vol_green==1.0) if (price_green==price_green and vol_green==vol_green) else np.nan
-
-    # close in day range
-    close_pct = close_in_range_pct({"high": row["high"], "low": row["low"], "close": row["close"]})
-
-    # ATR/TrueRange
-    atr20 = atr(df, 20).loc[idx] if len(df) >= 21 else np.nan
-    today_tr = true_range(df).loc[idx] if idx in df.index else np.nan
-    tr_ratio = float(today_tr / atr20) if (np.isfinite(today_tr) and np.isfinite(atr20) and atr20 > 0) else np.nan
-    atr_pct = float(atr20 / row["close"]) if (np.isfinite(atr20) and row["close"] > 0) else np.nan
-
-    # RS vs bench
-    if bench_df is not None and not bench_df.empty:
-        rs_pos = rs_slope_pos(df["close"], bench_df["close"], lookback=15)
-    else:
-        rs_pos = np.nan
-
-    # room to run / R:R (use prior-high up to idx-1)
-    high20 = df["high"].rolling(20).max().shift(1).loc[idx] if idx in df.index else np.nan
-    room_atr = float((high20 - row["close"]) / atr20) if (np.isfinite(high20) and np.isfinite(atr20) and atr20 > 0) else np.nan
-    stop = min(float(row["low"]), float(ema20.loc[idx])) if idx in ema20.index else float(row["low"])
-    risk = row["close"] - stop
-    reward = (high20 - row["close"]) if np.isfinite(high20) else np.nan
-    rr = float(reward / risk) if (np.isfinite(reward) and risk > 0 and reward > 0) else np.nan
-
-    # trend / EMA50 position
-    price_above_20 = float(row["close"] > ema20.loc[idx]) if idx in ema20.index else np.nan
-    price_above_50 = float(row["close"] > ema50.loc[idx]) if idx in ema50.index else np.nan
-    ema20_slope_pos = float(ema20.loc[idx] > ema20.shift(5).loc[idx]) if idx in ema20.index and idx in ema20.shift(5).index else np.nan
-
-    if idx in ema50.index:
-        e50 = float(ema50.loc[idx])
-        if e50 < row["low"]:
-            ema50_pos = "below_bar"; ema50_below_bar = 1.0; ema50_cut_bar = 0.0
-        elif e50 > row["high"]:
-            ema50_pos = "above_bar"; ema50_below_bar = 0.0; ema50_cut_bar = 0.0
-        else:
-            ema50_pos = "inside_bar"; ema50_below_bar = 0.0; ema50_cut_bar = 1.0
-        dist_close_ema50_atr = float((row["close"] - e50) / atr20) if np.isfinite(atr20) and atr20>0 else np.nan
-    else:
-        ema50_pos = ""; ema50_below_bar = np.nan; ema50_cut_bar = np.nan; dist_close_ema50_atr = np.nan
-
-    # overhead supply & AVWAP
-    overhead_supply_40 = overhead_supply_ratio(df, idx, lookback=40)
-    overhead_supply_20 = overhead_supply_ratio(df, idx, lookback=20)
-    anchor = find_swing_low_idx(df["close"], idx, lookback=30)
-    avwap  = anchored_vwap(df, anchor, idx)
-    price_above_avwap = float(row["close"] > avwap) if np.isfinite(avwap) else np.nan
-    dist_avwap_atr = float((row["close"] - avwap) / atr20) if (np.isfinite(avwap) and np.isfinite(atr20) and atr20>0) else np.nan
-
-    # float/turnover (from LargeCap.csv)
-    if float_map is not None and ticker in float_map and float_map[ticker] is not None and float_map[ticker] > 0:
-        fs = float(float_map[ticker])
-        float_turnover_pct = float(vol / fs) if np.isfinite(vol) else np.nan
-        float_turnover20_pct = float(v20 / fs) if (np.isfinite(v20) and fs > 0) else np.nan
-        float_shares_millions = float(fs / 1_000_000.0)
-    else:
-        float_turnover_pct = np.nan; float_turnover20_pct = np.nan; float_shares_millions = np.nan
-
-    out.update({
-        "open":  float(row["open"]),
-        "high":  float(row["high"]),
-        "low":   float(row["low"]),
-        "close": float(row["close"]),
-        "volume": int(row["volume"]) if not pd.isna(row["volume"]) else np.nan,
-
-        "rel_vol_20": rel_vol_20,
-        "vol_highest_10": vol_highest_10,
-        "vol_highest_5":  vol_highest_5,
-        "vol_rank_10":    vol_rank_10,
-        "vol_rank_20":    vol_rank_20,
-        "vol_pctile_20":  vol_pctile_20,
-
-        "price_green": price_green,
-        "vol_green":   vol_green,
-        "green_price_and_vol": green_price_and_vol,
-
-        "close_pct_in_range": close_pct,
-        "tr_ratio": tr_ratio,
-        "atr_pct": atr_pct,
-
-        "price_above_20": price_above_20,
-        "price_above_50": price_above_50,
-        "ema20_slope_pos": ema20_slope_pos,
-
-        "ema50_pos": ema50_pos,
-        "ema50_below_bar": ema50_below_bar,
-        "ema50_cut_bar": ema50_cut_bar,
-        "dist_close_ema50_atr": dist_close_ema50_atr,
-
-        "room_atr": room_atr,
-        "rr": rr,
-
-        "overhead_supply_40": overhead_supply_40,
-        "overhead_supply_20": overhead_supply_20,
-        "price_above_avwap": price_above_avwap,
-        "dist_avwap_atr": dist_avwap_atr,
-
-        "float_shares_millions": float_shares_millions,
-        "float_turnover_pct": float_turnover_pct,
-        "float_turnover20_pct": float_turnover20_pct,
-
-        "rs_slope_pos": float(rs_pos) if np.isfinite(rs_pos) else np.nan,
-    })
-    return out
+def bollinger_width_pct(close, n=20):
+    m = close.rolling(n).mean(); sd = close.rolling(n).std()
+    upper, lower = m + 2*sd, m - 2*sd
+    return (upper - lower) / close
 
 # ---------- Features & scoring ----------
 def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None, ticker: str, float_map: dict | None):
@@ -471,45 +340,312 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None, ticker: 
         log(f"[DEBUG {ticker}] EVENT={ed.date()}  CROSS={'PENDING' if evt['pending_cross'] else evt['cross_date'].date() if evt['cross_date'] is not None else 'None'} "
             f"| hist_event={evt['hist_event']:.5f} | hist_tail={', '.join(f'{x:.5f}' for x in hist.tail(4).values)}")
 
-    # ---- KPIs at event (base names) ----
-    k_event = compute_kpis_at(df, bench_df, ed, float_map, ticker)
+    row = df.loc[ed]
+    ema20 = ema(df["close"], 20)
+    ema50 = ema(df["close"], 50)
 
-    # ---- KPIs at today (add _today suffix) ----
-    k_today_raw = compute_kpis_at(df, bench_df, df.index[-1], float_map, ticker)
-    k_today = { (f"{k}_today" if k != "float_shares_millions" else k): v
-                for k, v in k_today_raw.items() }
+    # --- Liquidity/volumes (all as features; no filtering) ---
+    v20 = df["volume"].rolling(20).mean().loc[ed] if len(df) >= 20 else np.nan
+    vol = float(row["volume"]) if not pd.isna(row["volume"]) else np.nan
+    rel_vol_20 = float(vol / v20) if (np.isfinite(vol) and np.isfinite(v20) and v20>0) else np.nan
+    # Highest in recent windows?
+    vol_highest_10 = float(vol >= df["volume"].shift(1).rolling(10).max().loc[ed]) if len(df) >= 11 and np.isfinite(vol) else np.nan
+    vol_highest_5  = float(vol >= df["volume"].shift(1).rolling(5).max().loc[ed])  if len(df) >= 6  and np.isfinite(vol) else np.nan
+    # Rank & percentile
+    def _rank_in_window(series, ed, win):
+        if ed not in series.index: return np.nan
+        end = series.index.get_loc(ed); start = max(0, end - win + 1)
+        w = series.iloc[start:end+1]
+        if w.empty or pd.isna(series.loc[ed]): return np.nan
+        return float((w.rank(ascending=False, method="min").loc[ed]))
+    vol_rank_10 = _rank_in_window(df["volume"], ed, 10)
+    vol_rank_20 = _rank_in_window(df["volume"], ed, 20)
+    vol_pctile_20 = float(100.0 * (21 - vol_rank_20) / 20.0) if vol_rank_20 == vol_rank_20 else np.nan
 
-    # Histogram closeness to zero (signal quality) — event only
+    # --- Green price bar + green volume bar ---
+    prev_close = df["close"].shift(1).loc[ed] if ed in df.index else np.nan
+    price_green = float(row["close"] >= row["open"]) if (np.isfinite(row["close"]) and np.isfinite(row["open"])) else np.nan
+    vol_green   = float(row["close"] >= prev_close) if (np.isfinite(row["close"]) and np.isfinite(prev_close)) else np.nan
+    green_price_and_vol = float(price_green==1.0 and vol_green==1.0) if (price_green==price_green and vol_green==vol_green) else np.nan
+
+    # --- Close position + range expansion + ATR% ---
+    close_pct = close_in_range_pct({"high": row["high"], "low": row["low"], "close": row["close"]})
+    atr20 = atr(df, 20).loc[ed] if len(df) >= 21 else np.nan
+    today_tr = true_range(df).loc[ed] if ed in df.index else np.nan
+    tr_ratio = float(today_tr / atr20) if (np.isfinite(today_tr) and np.isfinite(atr20) and atr20 > 0) else np.nan
+    atr_pct = float(atr20 / row["close"]) if (np.isfinite(atr20) and row["close"] > 0) else np.nan
+
+    # --- Relative strength vs benchmark (optional) ---
+    if bench_df is not None and not bench_df.empty:
+        rs_pos = rs_slope_pos(df["close"], bench_df["close"], lookback=15)
+    else:
+        rs_pos = np.nan
+
+    # --- Room to run / R:R ---
+    high20 = df["high"].rolling(20).max().shift(1).loc[ed] if ed in df.index else np.nan
+    room_atr = float((high20 - row["close"]) / atr20) if (np.isfinite(high20) and np.isfinite(atr20) and atr20 > 0) else np.nan
+    stop = min(float(row["low"]), float(ema20.loc[ed])) if ed in ema20.index else float(row["low"])
+    risk = row["close"] - stop
+    reward = (high20 - row["close"]) if np.isfinite(high20) else np.nan
+    rr = float(reward / risk) if (np.isfinite(reward) and risk > 0 and reward > 0) else np.nan
+
+    # --- Trend / EMA locations ---
+    price_above_20 = float(row["close"] > ema20.loc[ed]) if ed in ema20.index else np.nan
+    price_above_50 = float(row["close"] > ema50.loc[ed]) if ed in ema50.index else np.nan
+    ema20_slope_pos = float(ema20.loc[ed] > ema20.shift(5).loc[ed]) if ed in ema20.index and ed in ema20.shift(5).index else np.nan
+    # EMA50 location relative to the bar
+    if ed in ema50.index:
+        e50 = float(ema50.loc[ed])
+        if e50 < row["low"]: ema50_pos = "below_bar"; ema50_below_bar = 1.0; ema50_cut_bar = 0.0
+        elif e50 > row["high"]: ema50_pos = "above_bar"; ema50_below_bar = 0.0; ema50_cut_bar = 0.0
+        else: ema50_pos = "inside_bar"; ema50_below_bar = 0.0; ema50_cut_bar = 1.0
+        dist_close_ema50_atr = float((row["close"] - e50) / atr20) if np.isfinite(atr20) and atr20>0 else np.nan
+    else:
+        ema50_pos = None; ema50_below_bar = np.nan; ema50_cut_bar = np.nan; dist_close_ema50_atr = np.nan
+
+    # --- Overhead supply + anchored VWAP context ---
+    overhead_supply_40 = overhead_supply_ratio(df, ed, lookback=40)
+    overhead_supply_20 = overhead_supply_ratio(df, ed, lookback=20)
+    anchor = find_swing_low_idx(df["close"], ed, lookback=30)
+    avwap  = anchored_vwap(df, anchor, ed)
+    price_above_avwap = float(row["close"] > avwap) if np.isfinite(avwap) else np.nan
+    dist_avwap_atr = float((row["close"] - avwap) / atr20) if (np.isfinite(avwap) and np.isfinite(atr20) and atr20>0) else np.nan
+
+    # --- Float turnover (from LargeCap.csv) ---
+    if float_map is not None and ticker in float_map and float_map[ticker] is not None and float_map[ticker] > 0:
+        fs = float(float_map[ticker])
+        float_turnover_pct = float(vol / fs) if np.isfinite(vol) else np.nan
+        float_turnover20_pct = float(v20 / fs) if (np.isfinite(v20) and fs > 0) else np.nan
+        float_shares_millions = float(fs / 1_000_000.0)
+    else:
+        float_turnover_pct = np.nan; float_turnover20_pct = np.nan; float_shares_millions = np.nan
+
+    # --- Histogram closeness to zero (signal quality) ---
     hist_value = float(evt["hist_event"])
     hist_closeness = float(-hist_value)
 
-    # Score (unchanged; event metrics only)
+    # Score (unchanged logic; just uses some of the above for convenience)
     score = (
-        W["price_above_20"] * (0.0 if np.isnan(k_event.get("price_above_20", np.nan)) else k_event.get("price_above_20")) +
-        W["price_above_50"] * (0.0 if np.isnan(k_event.get("price_above_50", np.nan)) else k_event.get("price_above_50")) +
-        W["ema20_slope_pos"] * (0.0 if np.isnan(k_event.get("ema20_slope_pos", np.nan)) else k_event.get("ema20_slope_pos")) +
-        W["vol_surge"] * (1.0 if (np.isfinite(k_event.get("rel_vol_20", np.nan)) and k_event.get("rel_vol_20") >= VOL_SURGE_MIN) else 0.0) +
-        W["close_high_pct"] * (1.0 if (np.isfinite(k_event.get("close_pct_in_range", np.nan)) and k_event.get("close_pct_in_range") >= CLOSE_UPPER_QTL) else 0.0) +
-        W["tr_expand"] * (1.0 if (np.isfinite(k_event.get("tr_ratio", np.nan)) and k_event.get("tr_ratio") >= TR_EXPAND_MIN) else 0.0) +
-        W["atr_sweet"] * (1.0 if (np.isfinite(k_event.get("atr_pct", np.nan)) and ATR_PCT_RANGE[0] <= k_event.get("atr_pct") <= ATR_PCT_RANGE[1]) else 0.0) +
-        W["rs_slope_pos"] * (0.0 if np.isnan(k_event.get("rs_slope_pos", np.nan)) else k_event.get("rs_slope_pos")) +
-        W["room_run"] * (1.0 if (np.isfinite(k_event.get("room_atr", np.nan)) and k_event.get("room_atr") >= ROOM_TO_RUN_ATR) else 0.0) +
-        W["rr_ok"] * (1.0 if (np.isfinite(k_event.get("rr", np.nan)) and k_event.get("rr") >= RR_MIN) else 0.0) +
+        W["price_above_20"] * (0.0 if np.isnan(price_above_20) else price_above_20) +
+        W["price_above_50"] * (0.0 if np.isnan(price_above_50) else price_above_50) +
+        W["ema20_slope_pos"] * (0.0 if np.isnan(ema20_slope_pos) else ema20_slope_pos) +
+        W["vol_surge"] * (1.0 if (np.isfinite(rel_vol_20) and rel_vol_20 >= VOL_SURGE_MIN) else 0.0) +
+        W["close_high_pct"] * (1.0 if close_pct >= CLOSE_UPPER_QTL else 0.0) +
+        W["tr_expand"] * (1.0 if (np.isfinite(tr_ratio) and tr_ratio >= TR_EXPAND_MIN) else 0.0) +
+        W["atr_sweet"] * (1.0 if (np.isfinite(atr_pct) and ATR_PCT_RANGE[0] <= atr_pct <= ATR_PCT_RANGE[1]) else 0.0) +
+        W["rs_slope_pos"] * (0.0 if np.isnan(rs_pos) else rs_pos) +
+        W["room_run"] * (1.0 if (np.isfinite(room_atr) and room_atr >= ROOM_TO_RUN_ATR) else 0.0) +
+        W["rr_ok"] * (1.0 if (np.isfinite(rr) and rr >= RR_MIN) else 0.0) +
         W["hist_closeness"] * np.tanh(max(0.0, hist_closeness) / 0.05) +
         (W["pending_penalty"] if evt["pending_cross"] else 0.0)
     )
 
-    out = {
+    # ------------------------------------------------------------------
+    # APPEND: "AS OF TODAY" KPIs (no changes to existing logic above)
+    # ------------------------------------------------------------------
+    t_idx = df.index[-1]
+    row_t = df.iloc[-1]
+    # today basics & EMAs
+    v20_t = df["volume"].rolling(20).mean().loc[t_idx] if len(df) >= 20 else np.nan
+    vol_t = float(row_t["volume"]) if not pd.isna(row_t["volume"]) else np.nan
+    rel_vol_20_today = float(vol_t / v20_t) if (np.isfinite(vol_t) and np.isfinite(v20_t) and v20_t > 0) else np.nan
+
+    vol_highest_10_today = float(vol_t >= df["volume"].shift(1).rolling(10).max().loc[t_idx]) if len(df) >= 11 and np.isfinite(vol_t) else np.nan
+    vol_highest_5_today  = float(vol_t >= df["volume"].shift(1).rolling(5).max().loc[t_idx])  if len(df) >= 6  and np.isfinite(vol_t) else np.nan
+    # rank/percentile today
+    def _rank_today(series, idx, win):
+        if idx not in series.index: return np.nan
+        end = series.index.get_loc(idx); start = max(0, end - win + 1)
+        w = series.iloc[start:end+1]
+        if w.empty or pd.isna(series.loc[idx]): return np.nan
+        return float((w.rank(ascending=False, method="min").loc[idx]))
+    vol_rank_20_today = _rank_today(df["volume"], t_idx, 20)
+    vol_pctile_20_today = float(100.0 * (21 - vol_rank_20_today) / 20.0) if vol_rank_20_today == vol_rank_20_today else np.nan
+
+    # green price & green volume today
+    prev_close_t = df["close"].shift(1).loc[t_idx] if t_idx in df.index else np.nan
+    price_green_today = float(row_t["close"] >= row_t["open"]) if (np.isfinite(row_t["close"]) and np.isfinite(row_t["open"])) else np.nan
+    vol_green_today   = float(row_t["close"] >= prev_close_t) if (np.isfinite(row_t["close"]) and np.isfinite(prev_close_t)) else np.nan
+    green_price_and_vol_today = float(price_green_today==1.0 and vol_green_today==1.0) if (price_green_today==price_green_today and vol_green_today==vol_green_today) else np.nan
+
+    # range / ATR today
+    atr20_t = atr(df, 20).loc[t_idx] if len(df) >= 21 else np.nan
+    tr_today = true_range(df).loc[t_idx] if t_idx in df.index else np.nan
+    tr_ratio_today = float(tr_today / atr20_t) if (np.isfinite(tr_today) and np.isfinite(atr20_t) and atr20_t > 0) else np.nan
+    atr_pct_today = float(atr20_t / row_t["close"]) if (np.isfinite(atr20_t) and row_t["close"] > 0) else np.nan
+
+    # close position in range today
+    rng = row_t["high"] - row_t["low"]
+    close_pct_in_range_today = float((row_t["close"] - row_t["low"]) / rng) if rng > 0 else 1.0
+
+    # RS (today window end)
+    if bench_df is not None and not bench_df.empty:
+        rs_slope_pos_today = rs_slope_pos(df["close"], bench_df["close"], lookback=15)
+    else:
+        rs_slope_pos_today = np.nan
+
+    # room & RR today
+    high20_today = df["high"].rolling(20).max().shift(1).loc[t_idx] if t_idx in df.index else np.nan
+    room_atr_today = float((high20_today - row_t["close"]) / atr20_t) if (np.isfinite(high20_today) and np.isfinite(atr20_t) and atr20_t > 0) else np.nan
+    ema20_t = ema20.loc[t_idx] if t_idx in ema20.index else np.nan
+    stop_t = min(float(row_t["low"]), float(ema20_t)) if np.isfinite(ema20_t) else float(row_t["low"])
+    risk_t = row_t["close"] - stop_t
+    reward_t = (high20_today - row_t["close"]) if np.isfinite(high20_today) else np.nan
+    rr_today = float(reward_t / risk_t) if (np.isfinite(reward_t) and risk_t > 0 and reward_t > 0) else np.nan
+
+    # EMA50 placement today
+    if t_idx in ema50.index:
+        e50_t = float(ema50.loc[t_idx])
+        if e50_t < row_t["low"]: ema50_pos_today = "below_bar"; ema50_below_bar_today = 1.0; ema50_cut_bar_today = 0.0
+        elif e50_t > row_t["high"]: ema50_pos_today = "above_bar"; ema50_below_bar_today = 0.0; ema50_cut_bar_today = 0.0
+        else: ema50_pos_today = "inside_bar"; ema50_below_bar_today = 0.0; ema50_cut_bar_today = 1.0
+        dist_close_ema50_atr_today = float((row_t["close"] - e50_t) / atr20_t) if np.isfinite(atr20_t) and atr20_t>0 else np.nan
+    else:
+        ema50_pos_today = ""
+        ema50_below_bar_today = np.nan
+        ema50_cut_bar_today = np.nan
+        dist_close_ema50_atr_today = np.nan
+
+    # overhead supply & AVWAP today
+    overhead_supply_40_today = overhead_supply_ratio(df, t_idx, lookback=40)
+    overhead_supply_20_today = overhead_supply_ratio(df, t_idx, lookback=20)
+    anchor_t = find_swing_low_idx(df["close"], t_idx, lookback=30)
+    avwap_t  = anchored_vwap(df, anchor_t, t_idx)
+    price_above_avwap_today = float(row_t["close"] > avwap_t) if np.isfinite(avwap_t) else np.nan
+    dist_avwap_atr_today = float((row_t["close"] - avwap_t) / atr20_t) if (np.isfinite(avwap_t) and np.isfinite(atr20_t) and atr20_t>0) else np.nan
+
+    # float turnover today
+    if float_map is not None and ticker in float_map and float_map[ticker] is not None and float_map[ticker] > 0:
+        fs = float(float_map[ticker])
+        float_turnover_pct_today = float(vol_t / fs) if np.isfinite(vol_t) else np.nan
+        float_turnover20_pct_today = float(v20_t / fs) if (np.isfinite(v20_t) and fs > 0) else np.nan
+    else:
+        float_turnover_pct_today = np.nan
+        float_turnover20_pct_today = np.nan
+
+    # power_score_today (parallel to your existing formula)
+    def _clip01_local(x):
+        try:
+            return float(max(0.0, min(1.0, x)))
+        except Exception:
+            return 0.0
+    def _sigmoid_local(x):
+        try:
+            return 1.0 / (1.0 + np.exp(-x))
+        except Exception:
+            return 0.0
+
+    energy_t = 0.6 * _sigmoid_local((rel_vol_20_today - 1.8)) \
+             + 0.4 * _sigmoid_local(((tr_ratio_today - 1.2) / 0.4) if np.isfinite(tr_ratio_today) else -999)
+    room_t = _clip01_local(((room_atr_today if np.isfinite(room_atr_today) else 0.0) / 1.5)) \
+           + 0.4 * _clip01_local(1.0 - (overhead_supply_40_today if np.isfinite(overhead_supply_40_today) else 0.5))
+    room_t = min(1.0, room_t)
+
+    ema_bonus_t = _clip01_local(max(0.0, dist_close_ema50_atr_today if np.isfinite(dist_close_ema50_atr_today) else 0.0) / 1.0)
+    avwap_bonus_t = _clip01_local(max(0.0, dist_avwap_atr_today if np.isfinite(dist_avwap_atr_today) else 0.0) / 0.7)
+    ema_pen_t = 0.15 if str(ema50_pos_today) == "above_bar" else 0.0
+    support_t = _clip01_local(0.5 * ema_bonus_t + 0.5 * avwap_bonus_t - ema_pen_t)
+
+    ft_t = float_turnover_pct_today if np.isfinite(float_turnover_pct_today) else 0.0
+    flow_turnover_t = _clip01_local((ft_t / 0.015) if ft_t > 0 else 0.0)
+    flow_vol_t = _clip01_local((vol_pctile_20_today or 0.0) / 100.0 if np.isfinite(vol_pctile_20_today) else 0.0)
+    flow_t = max(flow_turnover_t, flow_vol_t)
+
+    power_today = 0.35*energy_t + 0.30*room_t + 0.20*support_t + 0.15*flow_t
+    if green_price_and_vol_today == 1.0: power_today += 0.05
+    power_score_today = _clip01_local(power_today)
+
+    # ------------------------------------------------------------------
+
+    return {
+        # core event
         "ticker": ticker,
         "event_date": ed.date().isoformat(),
         "cross_date": (evt["cross_date"].date().isoformat() if evt["cross_date"] is not None else None),
         "pending_cross": bool(evt["pending_cross"]),
         "hist_event": hist_value,
         "score": float(score),
+
+        # price/volume basics
+        "open":  float(row["open"]),
+        "high":  float(row["high"]),
+        "low":   float(row["low"]),
+        "close": float(row["close"]),
+        "volume": int(row["volume"]) if not pd.isna(row["volume"]) else np.nan,
+        "rel_vol_20": float(rel_vol_20) if np.isfinite(rel_vol_20) else np.nan,
+        "vol_highest_10": float(vol_highest_10) if np.isfinite(vol_highest_10) else np.nan,
+        "vol_highest_5": float(vol_highest_5) if np.isfinite(vol_highest_5) else np.nan,
+        "vol_rank_10": float(vol_rank_10) if np.isfinite(vol_rank_10) else np.nan,
+        "vol_rank_20": float(vol_rank_20) if np.isfinite(vol_rank_20) else np.nan,
+        "vol_pctile_20": float(vol_pctile_20) if np.isfinite(vol_pctile_20) else np.nan,
+
+        # green bar diagnostics
+        "price_green": float(price_green) if np.isfinite(price_green) else np.nan,
+        "vol_green": float(vol_green) if np.isfinite(vol_green) else np.nan,
+        "green_price_and_vol": float(green_price_and_vol) if np.isfinite(green_price_and_vol) else np.nan,
+
+        # range/volatility
+        "close_pct_in_range": float(close_pct),
+        "tr_ratio": float(tr_ratio) if np.isfinite(tr_ratio) else np.nan,
+        "atr_pct": float(atr_pct) if np.isfinite(atr_pct) else np.nan,
+
+        # trend/location & EMA50 placement
+        "price_above_20": price_above_20,
+        "price_above_50": price_above_50,
+        "ema20_slope_pos": ema20_slope_pos,
+        "ema50_pos": ema50_pos if ema50_pos is not None else "",
+        "ema50_below_bar": float(ema50_below_bar) if ema50_below_bar==ema50_below_bar else np.nan,
+        "ema50_cut_bar": float(ema50_cut_bar) if ema50_cut_bar==ema50_cut_bar else np.nan,
+        "dist_close_ema50_atr": float(dist_close_ema50_atr) if np.isfinite(dist_close_ema50_atr) else np.nan,
+
+        # room / R:R
+        "room_atr": float(room_atr) if np.isfinite(room_atr) else np.nan,
+        "rr": float(rr) if np.isfinite(rr) else np.nan,
+
+        # overhead supply & AVWAP
+        "overhead_supply_40": float(overhead_supply_40) if np.isfinite(overhead_supply_40) else np.nan,
+        "overhead_supply_20": float(overhead_supply_20) if np.isfinite(overhead_supply_20) else np.nan,
+        "price_above_avwap": float(price_above_avwap) if np.isfinite(price_above_avwap) else np.nan,
+        "dist_avwap_atr": float(dist_avwap_atr) if np.isfinite(dist_avwap_atr) else np.nan,
+
+        # float / turnover
+        "float_shares_millions": float(float_shares_millions) if np.isfinite(float_shares_millions) else np.nan,
+        "float_turnover_pct": float(float_turnover_pct) if np.isfinite(float_turnover_pct) else np.nan,
+        "float_turnover20_pct": float(float_turnover20_pct) if np.isfinite(float_turnover20_pct) else np.nan,
+
+        # ================= TODAY KPIs (appended) =================
+        "rel_vol_20_today": float(rel_vol_20_today) if np.isfinite(rel_vol_20_today) else np.nan,
+        "vol_highest_10_today": float(vol_highest_10_today) if np.isfinite(vol_highest_10_today) else np.nan,
+        "vol_highest_5_today": float(vol_highest_5_today) if np.isfinite(vol_highest_5_today) else np.nan,
+        "vol_pctile_20_today": float(vol_pctile_20_today) if np.isfinite(vol_pctile_20_today) else np.nan,
+
+        "price_green_today": float(price_green_today) if np.isfinite(price_green_today) else np.nan,
+        "vol_green_today": float(vol_green_today) if np.isfinite(vol_green_today) else np.nan,
+        "green_price_and_vol_today": float(green_price_and_vol_today) if np.isfinite(green_price_and_vol_today) else np.nan,
+
+        "close_pct_in_range_today": float(close_pct_in_range_today) if np.isfinite(close_pct_in_range_today) else np.nan,
+        "tr_ratio_today": float(tr_ratio_today) if np.isfinite(tr_ratio_today) else np.nan,
+        "atr_pct_today": float(atr_pct_today) if np.isfinite(atr_pct_today) else np.nan,
+
+        "room_atr_today": float(room_atr_today) if np.isfinite(room_atr_today) else np.nan,
+        "rr_today": float(rr_today) if np.isfinite(rr_today) else np.nan,
+
+        "ema50_pos_today": ema50_pos_today,
+        "ema50_below_bar_today": float(ema50_below_bar_today) if ema50_below_bar_today==ema50_below_bar_today else np.nan,
+        "ema50_cut_bar_today": float(ema50_cut_bar_today) if ema50_cut_bar_today==ema50_cut_bar_today else np.nan,
+        "dist_close_ema50_atr_today": float(dist_close_ema50_atr_today) if np.isfinite(dist_close_ema50_atr_today) else np.nan,
+
+        "overhead_supply_40_today": float(overhead_supply_40_today) if np.isfinite(overhead_supply_40_today) else np.nan,
+        "overhead_supply_20_today": float(overhead_supply_20_today) if np.isfinite(overhead_supply_20_today) else np.nan,
+        "price_above_avwap_today": float(price_above_avwap_today) if np.isfinite(price_above_avwap_today) else np.nan,
+        "dist_avwap_atr_today": float(dist_avwap_atr_today) if np.isfinite(dist_avwap_atr_today) else np.nan,
+
+        "float_turnover_pct_today": float(float_turnover_pct_today) if np.isfinite(float_turnover_pct_today) else np.nan,
+        "float_turnover20_pct_today": float(float_turnover20_pct_today) if np.isfinite(float_turnover20_pct_today) else np.nan,
+
+        "power_score_today": float(power_score_today) if np.isfinite(power_score_today) else np.nan,
+        # =========================================================
     }
-    out.update(k_event)   # event KPIs with original names
-    out.update(k_today)   # today KPIs with _today suffix
-    return out
 
 # ---------- Main ----------
 def main():
@@ -556,7 +692,6 @@ def main():
 
     out = pd.DataFrame(rows).sort_values(["score", "event_date"], ascending=[False, False])
 
-    # -------- Power score + selection (your original logic; uses event KPIs) --------
     import numpy as np
 
     def _clip01(x): 
