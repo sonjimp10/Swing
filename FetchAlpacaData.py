@@ -53,7 +53,7 @@ def filter_rth_only(df):
 
 def main():
     #input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/Statistical Ratios.csv"
-    input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/LargeCap.csv"
+    input_file = "LargeCap.csv"
     # input_file = "/Users/jimutmukhopadhyay/Dummy Trading/AlpacaTrading/filtered_tickers_All.xlsx"
     # worksheet = "Combined Selected Tickers"
     #worksheet = "Sheet1"
