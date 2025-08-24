@@ -9,7 +9,6 @@ import gc
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', None)
 
-# ✅ Use shared API object — no session param
 api = tradeapi.REST(
     config.ALPACA_API_KEY,
     config.ALPACA_API_SECRET,
@@ -17,11 +16,7 @@ api = tradeapi.REST(
     api_version='v2'
 )
 
-
-def fetch_5min_data(api, ticker, days_back=30):
-    """
-    Fetch 5-minute bar data from Alpaca for the last 'days_back' days using SIP feed.
-    """
+def fetch_5min_data(api, ticker, days_back=10):
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=days_back)
 
@@ -34,8 +29,7 @@ def fetch_5min_data(api, ticker, days_back=30):
 
     return df
 
-
-def fetch_with_retries(api, ticker, days_back=30, max_retries=3, delay=3):
+def fetch_with_retries(api, ticker, days_back=10, max_retries=3, delay=3):
     for attempt in range(max_retries):
         try:
             return fetch_5min_data(api, ticker, days_back)
@@ -45,23 +39,16 @@ def fetch_with_retries(api, ticker, days_back=30, max_retries=3, delay=3):
     print(f"❌ Skipping {ticker} after {max_retries} attempts")
     return pd.DataFrame()
 
-
-def filter_rth_only(df):
+def filter_premarket_only(df):
     df.index = df.index.tz_convert('US/Eastern')
-    return df.between_time("09:30", "16:00").copy()
-
+    return df.between_time("04:00", "09:29:59").copy()
 
 def main():
     #input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/Statistical Ratios.csv"
-    input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/LargeCap.csv"
-    #input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/SmallCap.csv"
-    # input_file = "/Users/jimutmukhopadhyay/Dummy Trading/AlpacaTrading/filtered_tickers_All.xlsx"
-    # worksheet = "Combined Selected Tickers"
-    #worksheet = "Sheet1"
+    input_file = "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/SmallCap.csv"
     tickers_df = pd.read_csv(input_file)
-    #tickers_df = pd.read_excel(input_file, sheet_name=worksheet)
-    #tickers_df = tickers_df.head(200)
-    output_dir = "ALPACA_DATA"
+
+    output_dir = "ALPACA_PM_SC_DATA"
     os.makedirs(output_dir, exist_ok=True)
 
     for idx, row in tickers_df.iterrows():
@@ -78,25 +65,23 @@ def main():
             inplace=True
         )
 
-        df_rth = filter_rth_only(df)
+        df_pm = filter_premarket_only(df)
 
-        if df_rth.empty:
-            print(f"No RTH data for {ticker}.")
+        if df_pm.empty:
+            print(f"No Pre-Market data for {ticker}.")
             continue
 
-        df_rth.index = df_rth.index.tz_convert('Europe/Berlin')
-        df_rth.loc[:, 'Date'] = df_rth.index.strftime('%Y%m%d %H:%M:%S')
-        df_rth = df_rth[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
+        df_pm.index = df_pm.index.tz_convert('Europe/Berlin')
+        df_pm.loc[:, 'Date'] = df_pm.index.strftime('%Y%m%d %H:%M:%S')
+        df_pm = df_pm[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]
 
         csv_path = os.path.join(output_dir, f"{ticker}.csv")
-        df_rth.to_csv(csv_path, index=False)
-        #print(f"✅ Saved {ticker} data to {csv_path}")
+        df_pm.to_csv(csv_path, index=False)
+        print(f"✅ Saved Pre-Market data for {ticker} to {csv_path}")
 
-        # 🔄 Clean up memory every 10 tickers
-        del df, df_rth
+        del df, df_pm
         if idx % 10 == 0:
             gc.collect()
-
 
 if __name__ == "__main__":
     main()
