@@ -57,7 +57,7 @@ PM_W_POSITION= 0.10  # closing near PM high
 SIMULATE_PREOPEN = True
 # Choose the session you want to simulate and a pre-open time (before 09:30).
 # Example: simulate Aug 22, 2025 at 09:15 New York time.
-SIM_NOW_NY = "2025-08-22 09:25"   # format: YYYY-MM-DD HH:MM (NY time)
+SIM_NOW_NY = "2025-08-25 09:29"   # format: YYYY-MM-DD HH:MM (NY time)
 # -------------------------------------
 
 # Weights for the score (kept for convenience; NO filtering anywhere)
@@ -832,28 +832,30 @@ def features_for_event(df: pd.DataFrame, bench_df: pd.DataFrame | None, ticker: 
     y_close = float(y_row["close"]) if "close" in y_row else np.nan
     y_high  = float(y_row["high"])  if "high"  in y_row else np.nan
 
-    # --- Reference 'yesterday' consistently (do NOT include today) ---
-    # If df has at least 2 rows, yesterday is the penultimate row.
-    # This stays correct even if you later append a provisional 'today' row.
-    if len(df) >= 2:
-        y_idx = df.index[-2]
+    # --- Reference 'yesterday' robustly (works pre-open or with today appended) ---
+    today_naive = _now_ny().normalize().tz_localize(None)
+    if today_naive in df.index:
+        pos_today = df.index.get_loc(today_naive)
+        if not isinstance(pos_today, int):  # safety if index were non-unique
+            pos_today = int(pos_today.start)
+        y_loc = max(0, pos_today - 1)
     else:
-        y_idx = df.index[-1]  # fallback when there is only 1 row
+        # no 'today' candle in the daily file → yesterday is the last row
+        y_loc = len(df) - 1
 
-    y_low = float(df.loc[y_idx, "low"]) if "low" in df.columns else np.nan
+    y_idx = df.index[y_loc]
+    y_row = df.iloc[y_loc]
 
-    # Windows that END at yesterday:
-    # 2-day window = [day_before_yesterday, yesterday]
-    y_loc = df.index.get_loc(y_idx)
-    start2 = max(0, y_loc - 1)
-    win2 = df["low"].iloc[start2:y_loc+1]   # includes y_idx
+    y_close = float(y_row["close"])
+    y_high  = float(y_row["high"])
+    y_low   = float(y_row["low"])
 
-    # 5-day window = last up to 5 trading days ending at yesterday
-    start5 = max(0, y_loc - 4)
-    win5 = df["low"].iloc[start5:y_loc+1]   # includes y_idx
+    # Windows **ending at yesterday** (include y_idx)
+    win2 = df["low"].iloc[max(0, y_loc - 1): y_loc + 1]
+    win5 = df["low"].iloc[max(0, y_loc - 4): y_loc + 1]
 
-    prev_low_2d = float(np.isfinite(y_low) and (y_low == float(win2.min())))
-    prev_low_5d = float(np.isfinite(y_low) and (y_low == float(win5.min())))
+    prev_low_2d = float(len(win2) > 0 and y_low == float(win2.min()))
+    prev_low_5d = float(len(win5) > 0 and y_low == float(win5.min()))
 
 
     pm_feats = {}  # ADD THIS before any pm_feats.update(...)
@@ -1335,7 +1337,7 @@ def main():
 
     slim_outfile = OUTPUT_CSV.replace(".csv", "_SLIM.csv")
     slim_df.to_csv(slim_outfile, index=False)
-    print(f"✅ Slim CSV written: {slim_outfile}")
+    print(f"Slim CSV written: {slim_outfile}")
 
 
 if __name__ == "__main__":
