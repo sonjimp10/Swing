@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Small-Cap Momentum Screener (1–5 day timing bias) — ZERO-ARG RUN + FLOAT SHARES
 -------------------------------------------------------------------------------
@@ -8,7 +7,11 @@ Writes three CSVs into OUT_DIR:
   • screener_full_YYYYMMDD.csv       – all computed features (for auditing)
   • screener_debug_YYYYMMDD.csv      – diagnostics for every symbol (even failures)
 
-NEW: Reads `FloatShares` from your universe CSV and adds it to **all outputs**.
+Includes:
+  • Reads `FloatShares` from your universe CSV and adds it to all outputs.
+  • Improved **squeeze**: percentile + Keltner-channel test + ATR% cap.
+  • Volume pressure: 5‑day up/down volume ratio, OBV trend, Chaikin Money Flow.
+  • All‑time‑low flags and distance to ATL.
 """
 
 from __future__ import annotations
@@ -24,9 +27,9 @@ import sys
 # =========================
 RUN = {
     # Paths
-    "UNIVERSE": "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/VerySmallCap.csv",
-    "DATA_DIR": "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/ALPACA_VSC_DAILY_DATA",
-    "OUT_DIR":  "/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading",
+    "UNIVERSE": r"C:\Users\JMuk\Py Scripts Old\Swing\LargeCap.csv",
+    "DATA_DIR": r"C:\Users\JMuk\Py Scripts Old\Swing\ALPACA_DAILY_DATA",
+    "OUT_DIR":  r"C:\Users\JMuk\Py Scripts Old\Swing",
 
     # Core thresholds (permissive for small caps / short history)
     "MIN_PRICE": 0.5,
@@ -43,7 +46,7 @@ RUN = {
     "BB_LOOKBACK": 20,
     "BB_STD": 2.0,
     "SQUEEZE_WINDOW": 45,            # auto-clamped to len(data)
-    "SQUEEZE_PERCENTILE": 30.0,
+    "SQUEEZE_PERCENTILE": 35.0,      # wider threshold to catch more coils
     "ATR_LEN": 14,
     "DMI_LEN": 14,
     "EMA_FAST": 12,
@@ -51,6 +54,8 @@ RUN = {
     "EMA_SIGNAL": 9,
     "RSI_LEN": 14,
     "RSI2_LEN": 2,
+    "ATR_COMPRESSION_MAX": 0.07,     # <=7% ATR% counts as compressed
+    "KELTNER_MULT": 1.5,             # BB inside Keltner squeeze test
 
     # Modes
     "VERBOSE": True,                 # print skip reasons
@@ -74,7 +79,7 @@ W_RSI = 1.0
 # =========================
 
 def _ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+    return s.ewm(span=span, adjust=False, min_periods=max(2, span//2)).mean()
 
 
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
@@ -105,7 +110,7 @@ def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
     tr = true_range(high, low, close)
-    return tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    return tr.ewm(alpha=1/length, adjust=False, min_periods=max(2, length//2)).mean()
 
 
 def dmi_adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
@@ -114,11 +119,11 @@ def dmi_adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> T
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     tr = true_range(high, low, close)
-    atr_sm = tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    atr_sm = tr.ewm(alpha=1/length, adjust=False, min_periods=max(2, length//2)).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1/length, adjust=False).mean() / atr_sm)
     minus_di = 100 * (minus_dm.ewm(alpha=1/length, adjust=False).mean() / atr_sm)
     dx = 100 * (plus_di.subtract(minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-    adx = dx.ewm(alpha=1/length, adjust=False, min_periods=length).mean()
+    adx = dx.ewm(alpha=1/length, adjust=False, min_periods=max(2, length//2)).mean()
     return plus_di.fillna(0), minus_di.fillna(0), adx.fillna(0)
 
 @dataclass
@@ -230,41 +235,84 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_up"] = mid + RUN["BB_STD"] * std
     df["bb_low"] = mid - RUN["BB_STD"] * std
     df["bb_width"] = (df["bb_up"] - df["bb_low"]) / mid
-    # Squeeze percentile with adaptive window
-    eff_win = max(30, min(RUN["SQUEEZE_WINDOW"], max(len(df) - 5, 30)))
+    # Keltner Channels
+    ema20 = _ema(df["close"], 20)
+    kc_up = ema20 + RUN["KELTNER_MULT"] * df["atr14"]
+    kc_low = ema20 - RUN["KELTNER_MULT"] * df["atr14"]
+    df["kc_up"], df["kc_low"] = kc_up, kc_low
+
+    # Squeeze percentile with adaptive window (works on short histories)
+    eff_win = max(20, min(RUN["SQUEEZE_WINDOW"], max(len(df) - 5, 20)))
     def rolling_percentile(s: pd.Series, window: int, pct: float) -> pd.Series:
         return s.rolling(window).apply(lambda x: np.nanpercentile(x, pct), raw=False)
-    df["bb_width_p30"] = rolling_percentile(df["bb_width"], eff_win, RUN["SQUEEZE_PERCENTILE"])
-    df["squeeze"] = (df["bb_width"].le(df["bb_width_p30"]).fillna(False)).astype(int)
+    df["bb_width_pctl"] = rolling_percentile(df["bb_width"], eff_win, RUN["SQUEEZE_PERCENTILE"])
+
+    # Squeeze conditions
+    cond_pctile = df["bb_width"] <= df["bb_width_pctl"]
+    cond_keltner = (df["bb_up"] <= df["kc_up"]) & (df["bb_low"] >= df["kc_low"])  # BB inside KC
+    cond_atr = df["atrpct"] <= RUN["ATR_COMPRESSION_MAX"]
+
+    df["squeeze_on"] = (cond_pctile | cond_keltner | cond_atr).astype(int)
+    df["squeeze_score"] = cond_pctile.astype(int) + cond_keltner.astype(int) + cond_atr.astype(int)
+
     # Breakout vs 20D high (prev window to avoid same-day bias)
     df["rollmax20_prev"] = df["high"].shift(1).rolling(20).max()
     df["breakout20"] = (df["close"] >= df["rollmax20_prev"]).astype(int)
+    df["dist_to_20h"] = ((df["rollmax20_prev"] - df["close"]) / df["close"]).clip(lower=-1, upper=1)
+
     # NR7 & Inside-day
     df["range"] = df["high"] - df["low"]
     df["nr7"] = (df["range"] <= df["range"].shift(1).rolling(7).min()).astype(int)
     df["inside"] = ((df["high"] <= df["high"].shift(1)) & (df["low"] >= df["low"].shift(1))).astype(int)
+
     # DMI / ADX
     plus_di, minus_di, adx_v = dmi_adx(df["high"], df["low"], df["close"], RUN["DMI_LEN"])
     df["di_plus"] = plus_di
     df["di_minus"] = minus_di
     df["adx"] = adx_v
     df["adx_rising"] = (df["adx"].diff() > 0).astype(int)
+
     # MACD
     _, _, hist = macd_hist(df["close"], RUN["EMA_FAST"], RUN["EMA_SLOW"], RUN["EMA_SIGNAL"])
     df["macd_hist"] = hist
     df["macd_up"] = ((df["macd_hist"] > 0) | (df["macd_hist"].diff() > 0)).astype(int)
+
     # RSI
     df["rsi14"] = rsi(df["close"], RUN["RSI_LEN"])
     df["rsi2"] = rsi(df["close"], RUN["RSI2_LEN"])
+
     # 8 EMA for bounce context
     df["ema8"] = _ema(df["close"], 8)
+
+    # Volume pressure metrics
+    prev_close = df["close"].shift(1)
+    up_day = (df["close"] > prev_close).astype(int)
+    df["upvol5"] = (df["volume"] * (up_day == 1)).rolling(5).sum()
+    df["downvol5"] = (df["volume"] * (up_day == 0)).rolling(5).sum()
+    df["vol_balance5"] = (df["upvol5"] - df["downvol5"]) / (df["upvol5"] + df["downvol5"]).replace(0, np.nan)
+
+    # OBV & trend over 20 days
+    df["obv"] = (np.sign(df["close"].diff().fillna(0)) * df["volume"]).cumsum()
+    df["obv_trend20"] = df["obv"] - df["obv"].shift(20)
+
+    # Chaikin Money Flow (20)
+    mfm = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / (df["high"] - df["low"]).replace(0, np.nan)
+    mfv = mfm * df["volume"]
+    df["cmf20"] = mfv.rolling(20).sum() / df["volume"].rolling(20).sum()
+
+    # All-time low info (based on provided data)
+    df["atl_price"] = df["low"].cummin()
+    df["is_atl"] = (df["close"] <= df["atl_price"] * 1.01).astype(int)  # within 1% of dataset ATL
+    df["dist_to_atl"] = (df["close"] / df["atl_price"]) - 1.0
+
     return df
 
 
 def score_row(row: pd.Series, rvol_trigger: float, adx_min: float) -> Tuple[float, List[str]]:
     reasons = []
     score = 0.0
-    if row.get("squeeze", 0) == 1:
+    # Use new squeeze_on instead of old squeeze
+    if row.get("squeeze_on", 0) == 1:
         score += W_SQUEEZE; reasons.append("squeeze")
     if row.get("breakout20", 0) == 1:
         score += W_BREAKOUT; reasons.append("20D breakout")
@@ -284,9 +332,12 @@ def score_row(row: pd.Series, rvol_trigger: float, adx_min: float) -> Tuple[floa
 def process_symbol(symbol: str, data_dir: Path) -> Tuple[Optional[TickerResult], dict]:
     dbg = {"symbol": symbol, "status": "", "file": None, "rows": 0,
            "last_date": None, "close": np.nan, "sma20_vol": np.nan, "dollar_vol20": np.nan,
-           "rvol": np.nan, "bb_width": np.nan, "squeeze": np.nan, "breakout20": np.nan,
+           "rvol": np.nan, "bb_width": np.nan, "squeeze": np.nan, "squeeze_on": np.nan, "squeeze_score": np.nan,
+           "breakout20": np.nan, "dist_to_20h": np.nan,
            "nr7": np.nan, "inside_day": np.nan, "+DI": np.nan, "-DI": np.nan, "ADX": np.nan,
            "ADX_rising": np.nan, "MACD_hist": np.nan, "MACD_up": np.nan, "RSI14": np.nan, "RSI2": np.nan,
+           "upvol5": np.nan, "downvol5": np.nan, "vol_balance5": np.nan, "cmf20": np.nan, "obv_trend20": np.nan,
+           "is_atl": np.nan, "dist_to_atl": np.nan, "atl_price": np.nan,
            "pass_price": np.nan, "pass_avg_vol": np.nan, "pass_dollar_vol": np.nan, "score": np.nan, "reason": ""}
 
     f = find_ticker_file(Path(data_dir), symbol)
@@ -312,19 +363,30 @@ def process_symbol(symbol: str, data_dir: Path) -> Tuple[Optional[TickerResult],
         "sma20_vol": float(last["sma20_vol"]),
         "dollar_vol20": float(last["dollar_vol20"]),
         "rvol": float(last["rvol20"]),
-        "bb_width": float(last["bb_width"]) if np.isfinite(last["bb_width"]) else np.nan,
-        "squeeze": int(last["squeeze"]),
-        "breakout20": int(last["breakout20"]),
-        "nr7": int(last["nr7"]),
-        "inside_day": int(last["inside"]),
-        "+DI": float(last["di_plus"]),
-        "-DI": float(last["di_minus"]),
-        "ADX": float(last["adx"]),
-        "ADX_rising": int(last["adx_rising"]),
-        "MACD_hist": float(last["macd_hist"]),
-        "MACD_up": int(last["macd_up"]),
-        "RSI14": float(last["rsi14"]),
-        "RSI2": float(last["rsi2"]),
+        "bb_width": float(last.get("bb_width", np.nan)) if pd.notna(last.get("bb_width", np.nan)) else np.nan,
+        "squeeze": int(last.get("squeeze_on", 0)),
+        "squeeze_on": int(last.get("squeeze_on", 0)),
+        "squeeze_score": int(last.get("squeeze_score", 0)),
+        "breakout20": int(last.get("breakout20", 0)),
+        "dist_to_20h": float(last.get("dist_to_20h", np.nan)),
+        "nr7": int(last.get("nr7", 0)),
+        "inside_day": int(last.get("inside", 0)),
+        "+DI": float(last.get("di_plus", np.nan)),
+        "-DI": float(last.get("di_minus", np.nan)),
+        "ADX": float(last.get("adx", np.nan)),
+        "ADX_rising": int(last.get("adx_rising", 0)),
+        "MACD_hist": float(last.get("macd_hist", np.nan)),
+        "MACD_up": int(last.get("macd_up", 0)),
+        "RSI14": float(last.get("rsi14", np.nan)),
+        "RSI2": float(last.get("rsi2", np.nan)),
+        "upvol5": float(last.get("upvol5", np.nan)),
+        "downvol5": float(last.get("downvol5", np.nan)),
+        "vol_balance5": float(last.get("vol_balance5", np.nan)),
+        "cmf20": float(last.get("cmf20", np.nan)),
+        "obv_trend20": float(last.get("obv_trend20", np.nan)),
+        "is_atl": int(last.get("is_atl", 0)),
+        "dist_to_atl": float(last.get("dist_to_atl", np.nan)),
+        "atl_price": float(last.get("atl_price", np.nan)),
     })
 
     # Liquidity filters (optional)
@@ -352,19 +414,19 @@ def process_symbol(symbol: str, data_dir: Path) -> Tuple[Optional[TickerResult],
         last_close=float(last["close"]),
         avg_vol20=float(last["sma20_vol"]),
         rvol=float(last["rvol20"]),
-        bb_width=float(last["bb_width"]) if np.isfinite(last["bb_width"]) else np.nan,
-        squeeze=bool(int(last["squeeze"])),
-        breakout20=bool(int(last["breakout20"])),
-        nr7=bool(int(last["nr7"])),
-        inside_day=bool(int(last["inside"])),
-        di_plus=float(last["di_plus"]),
-        di_minus=float(last["di_minus"]),
-        adx=float(last["adx"]),
-        adx_rising=bool(int(last["adx_rising"])),
-        macd_hist=float(last["macd_hist"]),
-        macd_up=bool(int(last["macd_up"])),
-        rsi14=float(last["rsi14"]),
-        rsi2=float(last["rsi2"]),
+        bb_width=float(last.get("bb_width", np.nan)) if pd.notna(last.get("bb_width", np.nan)) else np.nan,
+        squeeze=bool(int(last.get("squeeze_on", 0))),
+        breakout20=bool(int(last.get("breakout20", 0))),
+        nr7=bool(int(last.get("nr7", 0))),
+        inside_day=bool(int(last.get("inside", 0))),
+        di_plus=float(last.get("di_plus", np.nan)),
+        di_minus=float(last.get("di_minus", np.nan)),
+        adx=float(last.get("adx", np.nan)),
+        adx_rising=bool(int(last.get("adx_rising", 0))),
+        macd_hist=float(last.get("macd_hist", np.nan)),
+        macd_up=bool(int(last.get("macd_up", 0))),
+        rsi14=float(last.get("rsi14", np.nan)),
+        rsi2=float(last.get("rsi2", np.nan)),
         score=float(score),
         reason=", ".join(reasons)
     )
@@ -416,18 +478,28 @@ def main():
             "avg_vol20": res.avg_vol20,
             "rvol": res.rvol,
             "bb_width": res.bb_width,
-            "squeeze": res.squeeze,
-            "breakout20": res.breakout20,
-            "nr7": res.nr7,
-            "inside_day": res.inside_day,
-            "+DI": res.di_plus,
-            "-DI": res.di_minus,
-            "ADX": res.adx,
-            "ADX_rising": res.adx_rising,
-            "MACD_hist": res.macd_hist,
-            "MACD_up": res.macd_up,
-            "RSI14": res.rsi14,
-            "RSI2": res.rsi2,
+            "squeeze_on": dbg["squeeze_on"],
+            "squeeze_score": dbg["squeeze_score"],
+            "breakout20": dbg["breakout20"],
+            "dist_to_20h": dbg["dist_to_20h"],
+            "nr7": dbg["nr7"],
+            "inside_day": dbg["inside_day"],
+            "+DI": dbg["+DI"],
+            "-DI": dbg["-DI"],
+            "ADX": dbg["ADX"],
+            "ADX_rising": dbg["ADX_rising"],
+            "MACD_hist": dbg["MACD_hist"],
+            "MACD_up": dbg["MACD_up"],
+            "RSI14": dbg["RSI14"],
+            "RSI2": dbg["RSI2"],
+            "upvol5": dbg["upvol5"],
+            "downvol5": dbg["downvol5"],
+            "vol_balance5": dbg["vol_balance5"],
+            "cmf20": dbg["cmf20"],
+            "obv_trend20": dbg["obv_trend20"],
+            "is_atl": dbg["is_atl"],
+            "dist_to_atl": dbg["dist_to_atl"],
+            "atl_price": dbg["atl_price"],
             "score": res.score,
             "reason": res.reason,
             "float_shares": fs,
@@ -445,10 +517,8 @@ def main():
     full_df = pd.DataFrame(full_rows)
     if full_df.empty or "score" not in full_df.columns:
         full_df.to_csv(out_full, index=False)
-        print("No valid symbols after feature build / filters.\
-"
-              "Tips: set SKIP_LIQUIDITY=True in RUN, lower MIN_* thresholds, or confirm OHLCV headers.\
-"
+        print("No valid symbols after feature build / filters.\n"
+              "Tips: set SKIP_LIQUIDITY=True in RUN, lower MIN_* thresholds, or confirm OHLCV headers.\n"
               f"Full features saved (may be empty): {out_full}")
         if RUN["DIAGNOSTICS"]:
             print(f"Diagnostics saved: {out_dbg}")
@@ -463,8 +533,8 @@ def main():
 
     print(f"Processed {len(symbols)} symbols. Candidates: {len(candidates_df)}")
     if not candidates_df.empty:
-        print(candidates_df[["symbol","score","rvol","breakout20","squeeze","ADX","ADX_rising","MACD_up","RSI14","float_shares"]].head(20).to_string(index=False))
-        print(f"Saved: {out_cand}")
+        print(candidates_df[["symbol","score","rvol","breakout20","squeeze_on","squeeze_score","ADX","ADX_rising","MACD_up","RSI14","vol_balance5","cmf20","float_shares","is_atl","dist_to_atl"]].head(20).to_string(index=False))
+        print(f"\nSaved: {out_cand}")
     print(f"Full features saved: {out_full}")
     if RUN["DIAGNOSTICS"]:
         print(f"Diagnostics saved: {out_dbg}")
