@@ -27,9 +27,9 @@ import sys
 # =========================
 RUN = {
     # Paths
-    "UNIVERSE": r"/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/SmallCap.csv",
-    "DATA_DIR": r"/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading/ALPACA_SC_DAILY_DATA",
-    "OUT_DIR":  r"/Users/jimutmukhopadhyay/Dummy Trading/IntraDay Trading",
+    "UNIVERSE": r"C:\Users\JMuk\Py Scripts Old\Swing\SmallCap.csv",
+    "DATA_DIR": r"C:\Users\JMuk\Py Scripts Old\Swing\ALPACA_SC_DAILY_DATA",
+    "OUT_DIR":  r"C:\Users\JMuk\Py Scripts Old\Swing",
 
     # Core thresholds (permissive for small caps / short history)
     "MIN_PRICE": 0.5,
